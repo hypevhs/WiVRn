@@ -1,0 +1,1322 @@
+From 87f143ceb77f2f3c342638bf8347cfc4f740fb32 Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Sat, 30 May 2026 10:39:30 +0200
+Subject: [PATCH 01/11] c/util: Use reference counting for fences
+
+Signed-off-by: Patrick Nicolas <patricknicolas@laposte.net>
+---
+ .../compositor/multi/comp_multi_compositor.c  |  2 +-
+ src/xrt/compositor/util/comp_sync.c           |  1 +
+ src/xrt/include/xrt/xrt_compositor.h          | 40 ++++++++++++++-----
+ 3 files changed, 31 insertions(+), 12 deletions(-)
+
+diff --git a/src/xrt/compositor/multi/comp_multi_compositor.c b/src/xrt/compositor/multi/comp_multi_compositor.c
+index 33675d43f..65b6d4e23 100644
+--- a/src/xrt/compositor/multi/comp_multi_compositor.c
++++ b/src/xrt/compositor/multi/comp_multi_compositor.c
+@@ -145,7 +145,7 @@ wait_fence(struct multi_compositor *mc, struct xrt_compositor_fence **xcf_ptr)
+ 		U_LOG_W("Waiting on client fence timed out > 100ms!");
+ 	} while (os_thread_helper_is_running(&mc->wait_thread.oth));
+ 
+-	xrt_compositor_fence_destroy(xcf_ptr);
++	xrt_compositor_fence_reference(xcf_ptr, NULL);
+ 
+ 	if (ret != XRT_SUCCESS) {
+ 		U_LOG_E("Fence waiting failed!");
+diff --git a/src/xrt/compositor/util/comp_sync.c b/src/xrt/compositor/util/comp_sync.c
+index 6a4ffb833..b2ca933af 100644
+--- a/src/xrt/compositor/util/comp_sync.c
++++ b/src/xrt/compositor/util/comp_sync.c
+@@ -112,6 +112,7 @@ comp_fence_import(struct vk_bundle *vk, xrt_graphics_sync_handle_t handle, struc
+ 	VK_NAME_FENCE(vk, fence, "Comp Sync");
+ 
+ 	struct fence *f = U_TYPED_CALLOC(struct fence);
++	f->base.reference.count = 1;
+ 	f->base.wait = fence_wait;
+ 	f->base.destroy = fence_destroy;
+ 	f->fence = fence;
+diff --git a/src/xrt/include/xrt/xrt_compositor.h b/src/xrt/include/xrt/xrt_compositor.h
+index 76c1f7e9b..3d2556f8e 100644
+--- a/src/xrt/include/xrt/xrt_compositor.h
++++ b/src/xrt/include/xrt/xrt_compositor.h
+@@ -786,6 +786,11 @@ xrt_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
+  */
+ struct xrt_compositor_fence
+ {
++	/*!
++	 * Reference helper.
++	 */
++	struct xrt_reference reference;
++
+ 	/*!
+ 	 * Waits on the fence with the given timeout.
+ 	 */
+@@ -811,23 +816,36 @@ xrt_compositor_fence_wait(struct xrt_compositor_fence *xcf, uint64_t timeout)
+ }
+ 
+ /*!
+- * @copydoc xrt_compositor_fence::destroy
+- *
+- * Helper for calling through the function pointer: does a null check and sets
+- * xcf_ptr to null if freed.
++ * Update the reference counts on compositor fence(s).
+  *
+- * @public @memberof xrt_compositor_fence
++ * @param[in,out] dst Pointer to a object reference: if the object reference is
++ *                non-null will decrement its counter. The reference that
++ *                @p dst points to will be set to @p src.
++ * @param[in] src New object for @p dst to refer to (may be null).
++ *                If non-null, will have its refcount increased.
++ * @ingroup xrt_iface
++ * @relates xrt_compositor_fence
+  */
+-static inline void
+-xrt_compositor_fence_destroy(struct xrt_compositor_fence **xcf_ptr)
++XRT_NONNULL_FIRST static inline void
++xrt_compositor_fence_reference(struct xrt_compositor_fence **dst, struct xrt_compositor_fence *src)
+ {
+-	struct xrt_compositor_fence *xcf = *xcf_ptr;
+-	if (xcf == NULL) {
++	struct xrt_compositor_fence *old_dst = *dst;
++
++	if (old_dst == src) {
+ 		return;
+ 	}
+ 
+-	xcf->destroy(xcf);
+-	*xcf_ptr = NULL;
++	if (src) {
++		xrt_reference_inc(&src->reference);
++	}
++
++	*dst = src;
++
++	if (old_dst) {
++		if (xrt_reference_dec_and_is_zero(&old_dst->reference)) {
++			old_dst->destroy(old_dst);
++		}
++	}
+ }
+ 
+ 
+-- 
+2.55.0
+
+
+From 235e3b0411a2efe61e0b4a674d8f3f55ac8c6490 Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Sat, 30 May 2026 11:00:27 +0200
+Subject: [PATCH 02/11] c/util: pass handle type to import fence
+
+Signed-off-by: Patrick Nicolas <patricknicolas@laposte.net>
+---
+ src/xrt/auxiliary/vk/vk_helpers.h             |  5 +-
+ src/xrt/auxiliary/vk/vk_sync_objects.c        | 89 +++++++++++--------
+ .../compositor/multi/comp_multi_compositor.c  |  4 +-
+ src/xrt/compositor/util/comp_base.c           | 15 +++-
+ src/xrt/compositor/util/comp_sync.c           |  7 +-
+ src/xrt/compositor/util/comp_sync.h           |  5 +-
+ src/xrt/include/xrt/xrt_compositor.h          |  4 +-
+ src/xrt/include/xrt/xrt_handles.h             | 16 +++-
+ 8 files changed, 95 insertions(+), 50 deletions(-)
+
+diff --git a/src/xrt/auxiliary/vk/vk_helpers.h b/src/xrt/auxiliary/vk/vk_helpers.h
+index f14b2ddb4..6885f11bc 100644
+--- a/src/xrt/auxiliary/vk/vk_helpers.h
++++ b/src/xrt/auxiliary/vk/vk_helpers.h
+@@ -1277,7 +1277,10 @@ vk_create_and_submit_fence_native(struct vk_bundle *vk, xrt_graphics_sync_handle
+  * @ingroup aux_vk
+  */
+ XRT_CHECK_RESULT VkResult
+-vk_create_fence_sync_from_native(struct vk_bundle *vk, xrt_graphics_sync_handle_t native, VkFence *out_fence);
++vk_create_fence_sync_from_native(struct vk_bundle *vk,
++                                 xrt_graphics_sync_handle_t native,
++                                 VkExternalFenceHandleTypeFlagBits handle_type,
++                                 VkFence *out_fence);
+ 
+ /*!
+  * Creates a Vulkan semaphore and a native graphics sync handle.
+diff --git a/src/xrt/auxiliary/vk/vk_sync_objects.c b/src/xrt/auxiliary/vk/vk_sync_objects.c
+index 6d95b528a..6454ef8b8 100644
+--- a/src/xrt/auxiliary/vk/vk_sync_objects.c
++++ b/src/xrt/auxiliary/vk/vk_sync_objects.c
+@@ -335,7 +335,10 @@ vk_create_timeline_semaphore_and_native(struct vk_bundle *vk,
+  */
+ 
+ XRT_CHECK_RESULT VkResult
+-vk_create_fence_sync_from_native(struct vk_bundle *vk, xrt_graphics_sync_handle_t native, VkFence *out_fence)
++vk_create_fence_sync_from_native(struct vk_bundle *vk,
++                                 xrt_graphics_sync_handle_t native,
++                                 VkExternalFenceHandleTypeFlagBits handle_type,
++                                 VkFence *out_fence)
+ {
+ 	VkFence fence = VK_NULL_HANDLE;
+ 	VkResult ret;
+@@ -355,46 +358,54 @@ vk_create_fence_sync_from_native(struct vk_bundle *vk, xrt_graphics_sync_handle_
+ 	VK_NAME_FENCE(vk, fence, "VK Import");
+ 
+ 
+-#ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
+-	// This is what is used on Linux Mesa when importing fences from OpenGL.
+-	VkExternalFenceHandleTypeFlagBits handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+-
+-	VkImportFenceFdInfoKHR import_info = {
+-	    .sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR,
+-	    .fence = fence,
+-	    .handleType = handleType,
+-	    .flags = VK_FENCE_IMPORT_TEMPORARY_BIT,
+-	    .fd = native,
+-	};
+-
+-	ret = vk->vkImportFenceFdKHR(vk->device, &import_info);
+-	if (ret != VK_SUCCESS) {
+-		vk->vkDestroyFence(vk->device, fence, NULL);
+-		VK_ERROR(vk, "vkImportFenceFdKHR: %s", vk_result_string(ret));
+-		return ret;
+-	}
+-#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+-	//! @todo make sure this is the right one
+-	VkExternalFenceHandleTypeFlagBits handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+-	VkImportFenceWin32HandleInfoKHR import_info = {
+-	    .sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_WIN32_HANDLE_INFO_KHR,
+-	    .pNext = NULL,
+-	    .fence = fence,
+-	    .flags = 0, /** @todo do we want the temporary flag? */
+-	    .handleType = handleType,
+-	    .handle = native,
+-	    .name = NULL, /* not importing by name */
+-	};
+-
+-	ret = vk->vkImportFenceWin32HandleKHR(vk->device, &import_info);
+-	if (ret != VK_SUCCESS) {
+-		vk->vkDestroyFence(vk->device, fence, NULL);
+-		VK_ERROR(vk, "vkImportFenceFdKHR: %s", vk_result_string(ret));
+-		return ret;
+-	}
++	switch (handle_type) {
++#if defined(VK_USE_PLATFORM_WIN32_KHR)
++	case VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT: {
++		//! @todo make sure this is the right one
++		VkImportFenceWin32HandleInfoKHR import_info = {
++		    .sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_WIN32_HANDLE_INFO_KHR,
++		    .pNext = NULL,
++		    .fence = fence,
++		    .flags = 0, /** @todo do we want the temporary flag? */
++		    .handleType = handle_type,
++		    .handle = native,
++		    .name = NULL, /* not importing by name */
++		};
++
++		ret = vk->vkImportFenceWin32HandleKHR(vk->device, &import_info);
++		if (ret != VK_SUCCESS) {
++			vk->vkDestroyFence(vk->device, fence, NULL);
++			VK_ERROR(vk, "vkImportFenceFdKHR: %s", vk_result_string(ret));
++			return ret;
++		}
++	} break;
+ #else
+-#error "Need port to import fence sync handles"
++	case VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT:
++	case VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT: {
++		VkImportFenceFdInfoKHR import_info = {
++		    .sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR,
++		    .fence = fence,
++		    .handleType = handle_type,
++		    .fd = native,
++		};
++		// This is what is used on Linux Mesa when importing fences from OpenGL.
++		if (handle_type == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT) {
++			import_info.flags |= VK_FENCE_IMPORT_TEMPORARY_BIT;
++		}
++
++		ret = vk->vkImportFenceFdKHR(vk->device, &import_info);
++		if (ret != VK_SUCCESS) {
++			vk->vkDestroyFence(vk->device, fence, NULL);
++			VK_ERROR(vk, "vkImportFenceFdKHR: %s", vk_result_string(ret));
++			return ret;
++		}
++	} break;
+ #endif
++	default:
++		vk->vkDestroyFence(vk->device, fence, NULL);
++		VK_ERROR(vk, "Invalid handle type");
++		return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++	}
+ 
+ 	*out_fence = fence;
+ 
+diff --git a/src/xrt/compositor/multi/comp_multi_compositor.c b/src/xrt/compositor/multi/comp_multi_compositor.c
+index 65b6d4e23..7deb507d2 100644
+--- a/src/xrt/compositor/multi/comp_multi_compositor.c
++++ b/src/xrt/compositor/multi/comp_multi_compositor.c
+@@ -448,13 +448,14 @@ multi_compositor_import_swapchain(struct xrt_compositor *xc,
+ static xrt_result_t
+ multi_compositor_import_fence(struct xrt_compositor *xc,
+                               xrt_graphics_sync_handle_t handle,
++                              enum xrt_graphics_sync_handle_type handle_type,
+                               struct xrt_compositor_fence **out_xcf)
+ {
+ 	COMP_TRACE_MARKER();
+ 
+ 	struct multi_compositor *mc = multi_compositor(xc);
+ 
+-	return xrt_comp_import_fence(&mc->msc->xcn->base, handle, out_xcf);
++	return xrt_comp_import_fence(&mc->msc->xcn->base, handle, handle_type, out_xcf);
+ }
+ 
+ static xrt_result_t
+@@ -791,6 +792,7 @@ multi_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
+ 		xrt_result_t xret = xrt_comp_import_fence( //
+ 		    &mc->msc->xcn->base,                   //
+ 		    sync_handle,                           //
++		    XRT_TEMPORARY_FENCE_HANDLE_TYPE,       //
+ 		    &xcf);                                 //
+ 		/*!
+ 		 * If import_fence succeeded, we have transferred ownership to
+diff --git a/src/xrt/compositor/util/comp_base.c b/src/xrt/compositor/util/comp_base.c
+index fa3428be9..a89c5669b 100644
+--- a/src/xrt/compositor/util/comp_base.c
++++ b/src/xrt/compositor/util/comp_base.c
+@@ -74,11 +74,22 @@ base_import_swapchain(struct xrt_compositor *xc,
+ 
+ //! Delegates to code in `comp_sync`
+ static xrt_result_t
+-base_import_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t handle, struct xrt_compositor_fence **out_xcf)
++base_import_fence(struct xrt_compositor *xc,
++                  xrt_graphics_sync_handle_t handle,
++                  enum xrt_graphics_sync_handle_type handle_type,
++                  struct xrt_compositor_fence **out_xcf)
+ {
+ 	struct comp_base *cb = comp_base(xc);
+ 
+-	return comp_fence_import(&cb->vk, handle, out_xcf);
++	VkExternalFenceHandleTypeFlagBits vk_handle_type;
++	switch (handle_type) {
++	case XRT_SYNC_HANDLE_OPAQUE_FD: vk_handle_type = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT; break;
++	case XRT_SYNC_HANDLE_SYNC_FD: vk_handle_type = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT; break;
++	case XRT_SYNC_HANDLE_OPAQUE_WIN32: vk_handle_type = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT; break;
++	default: U_LOG_E("Invalid handle type %d", handle_type); return XRT_ERROR_INVALID_ARGUMENT;
++	}
++
++	return comp_fence_import(&cb->vk, handle, vk_handle_type, out_xcf);
+ }
+ 
+ //! Delegates to code in `comp_semaphore`
+diff --git a/src/xrt/compositor/util/comp_sync.c b/src/xrt/compositor/util/comp_sync.c
+index b2ca933af..5e6a414ae 100644
+--- a/src/xrt/compositor/util/comp_sync.c
++++ b/src/xrt/compositor/util/comp_sync.c
+@@ -97,13 +97,16 @@ fence_destroy(struct xrt_compositor_fence *xcf)
+  */
+ 
+ xrt_result_t
+-comp_fence_import(struct vk_bundle *vk, xrt_graphics_sync_handle_t handle, struct xrt_compositor_fence **out_xcf)
++comp_fence_import(struct vk_bundle *vk,
++                  xrt_graphics_sync_handle_t handle,
++                  VkExternalFenceHandleTypeFlagBits handle_type,
++                  struct xrt_compositor_fence **out_xcf)
+ {
+ 	COMP_TRACE_MARKER();
+ 
+ 	VkFence fence = VK_NULL_HANDLE;
+ 
+-	VkResult ret = vk_create_fence_sync_from_native(vk, handle, &fence);
++	VkResult ret = vk_create_fence_sync_from_native(vk, handle, handle_type, &fence);
+ 	if (ret != VK_SUCCESS) {
+ 		return XRT_ERROR_VULKAN;
+ 	}
+diff --git a/src/xrt/compositor/util/comp_sync.h b/src/xrt/compositor/util/comp_sync.h
+index 9cc461e59..385aab764 100644
+--- a/src/xrt/compositor/util/comp_sync.h
++++ b/src/xrt/compositor/util/comp_sync.h
+@@ -29,7 +29,10 @@ extern "C" {
+  * @ingroup comp_util
+  */
+ xrt_result_t
+-comp_fence_import(struct vk_bundle *vk, xrt_graphics_sync_handle_t handle, struct xrt_compositor_fence **out_xcf);
++comp_fence_import(struct vk_bundle *vk,
++                  xrt_graphics_sync_handle_t handle,
++                  VkExternalFenceHandleTypeFlagBits handle_type,
++                  struct xrt_compositor_fence **out_xcf);
+ 
+ 
+ #ifdef __cplusplus
+diff --git a/src/xrt/include/xrt/xrt_compositor.h b/src/xrt/include/xrt/xrt_compositor.h
+index 3d2556f8e..09467bceb 100644
+--- a/src/xrt/include/xrt/xrt_compositor.h
++++ b/src/xrt/include/xrt/xrt_compositor.h
+@@ -1108,6 +1108,7 @@ struct xrt_compositor
+ 	 */
+ 	xrt_result_t (*import_fence)(struct xrt_compositor *xc,
+ 	                             xrt_graphics_sync_handle_t handle,
++	                             enum xrt_graphics_sync_handle_type handle_type,
+ 	                             struct xrt_compositor_fence **out_xcf);
+ 
+ 	/*!
+@@ -1560,9 +1561,10 @@ xrt_comp_import_swapchain(struct xrt_compositor *xc,
+ XRT_NONNULL_ALL static inline xrt_result_t
+ xrt_comp_import_fence(struct xrt_compositor *xc,
+                       xrt_graphics_sync_handle_t handle,
++                      enum xrt_graphics_sync_handle_type handle_type,
+                       struct xrt_compositor_fence **out_xcf)
+ {
+-	return xc->import_fence(xc, handle, out_xcf);
++	return xc->import_fence(xc, handle, handle_type, out_xcf);
+ }
+ 
+ /*!
+diff --git a/src/xrt/include/xrt/xrt_handles.h b/src/xrt/include/xrt/xrt_handles.h
+index 3657498cd..e6222abae 100644
+--- a/src/xrt/include/xrt/xrt_handles.h
++++ b/src/xrt/include/xrt/xrt_handles.h
+@@ -336,15 +336,21 @@ xrt_graphics_buffer_is_valid(xrt_graphics_buffer_handle_t handle)
+ #error "Not yet implemented for this platform"
+ #endif
+ 
+-#ifdef XRT_OS_UNIX
+-
+-
+ /*
+  *
+  * xrt_graphics_sync_handle_t
+  *
+  */
+ 
++enum xrt_graphics_sync_handle_type
++{
++	XRT_SYNC_HANDLE_OPAQUE_FD,
++	XRT_SYNC_HANDLE_SYNC_FD,
++	XRT_SYNC_HANDLE_OPAQUE_WIN32,
++};
++
++#ifdef XRT_OS_UNIX
++
+ /*!
+  * The type underlying synchronization primitives (semaphores, etc) shared
+  * between compositor clients and the main compositor.
+@@ -360,6 +366,8 @@ typedef int xrt_graphics_sync_handle_t;
+  */
+ #define XRT_GRAPHICS_SYNC_HANDLE_IS_FD 1
+ 
++#define XRT_TEMPORARY_FENCE_HANDLE_TYPE XRT_SYNC_HANDLE_SYNC_FD
++
+ /*!
+  * Check whether a graphics sync handle is valid.
+  *
+@@ -398,6 +406,8 @@ typedef HANDLE xrt_graphics_sync_handle_t;
+  */
+ #define XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE 1
+ 
++#define XRT_TEMPORARY_FENCE_HANDLE_TYPE XRT_SYNC_HANDLE_OPAQUE_WIN32
++
+ /*!
+  * Check whether a graphics sync handle is valid.
+  *
+-- 
+2.55.0
+
+
+From 553819f5dd4a031110260ae7f7078abd247c0417 Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Sat, 30 May 2026 11:24:03 +0200
+Subject: [PATCH 03/11] xrt/compositor: Add commit_with_fence
+
+Signed-off-by: Patrick Nicolas <patricknicolas@laposte.net>
+---
+ src/xrt/include/xrt/xrt_compositor.h | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/xrt/include/xrt/xrt_compositor.h b/src/xrt/include/xrt/xrt_compositor.h
+index 09467bceb..72236009d 100644
+--- a/src/xrt/include/xrt/xrt_compositor.h
++++ b/src/xrt/include/xrt/xrt_compositor.h
+@@ -1421,6 +1421,16 @@ struct xrt_compositor
+ 	 */
+ 	xrt_result_t (*layer_commit)(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle);
+ 
++	/*!
++	 * @brief Commits all of the submitted layers, with a fence.
++	 *
++	 * Only after this call will the compositor actually use the layers.
++	 * @param xc          Self pointer
++	 * @param xcf         Fence that will be signalled when the app GPU
++	 *                    work has completed.
++	 */
++	xrt_result_t (*layer_commit_with_fence)(struct xrt_compositor *xc, struct xrt_compositor_fence *xcf);
++
+ 	/*!
+ 	 * @brief Commits all of the submitted layers, with a semaphore.
+ 	 *
+@@ -1905,6 +1915,19 @@ xrt_comp_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync
+ 	return xc->layer_commit(xc, sync_handle);
+ }
+ 
++/*!
++ * @copydoc xrt_compositor::layer_commit_with_fence
++ *
++ * Helper for calling through the function pointer.
++ *
++ * @public @memberof xrt_compositor
++ */
++XRT_NONNULL_ALL static inline xrt_result_t
++xrt_comp_layer_commit_with_fence(struct xrt_compositor *xc, struct xrt_compositor_fence *xcf)
++{
++	return xc->layer_commit_with_fence(xc, xcf);
++}
++
+ /*!
+  * @copydoc xrt_compositor::layer_commit_with_semaphore
+  *
+-- 
+2.55.0
+
+
+From 74ba1b76e12ad735be4e9db6e5eda27ef11dde17 Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Sat, 30 May 2026 11:28:19 +0200
+Subject: [PATCH 04/11] c/multi: Implement layer_commit_with_fence
+
+Signed-off-by: Patrick Nicolas <patricknicolas@laposte.net>
+---
+ src/xrt/compositor/multi/comp_multi_compositor.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/xrt/compositor/multi/comp_multi_compositor.c b/src/xrt/compositor/multi/comp_multi_compositor.c
+index 7deb507d2..153aba660 100644
+--- a/src/xrt/compositor/multi/comp_multi_compositor.c
++++ b/src/xrt/compositor/multi/comp_multi_compositor.c
+@@ -822,6 +822,19 @@ multi_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
+ 	return XRT_SUCCESS;
+ }
+ 
++static xrt_result_t
++multi_compositor_layer_commit_with_fence(struct xrt_compositor *xc, struct xrt_compositor_fence *xcf)
++{
++	COMP_TRACE_MARKER();
++
++	struct multi_compositor *mc = multi_compositor(xc);
++	int64_t frame_id = mc->progress.data.frame_id;
++
++	push_fence_to_wait_thread(mc, frame_id, xcf);
++
++	return XRT_SUCCESS;
++}
++
+ static xrt_result_t
+ multi_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
+                                              struct xrt_compositor_semaphore *xcsem,
+@@ -1003,6 +1016,7 @@ multi_compositor_create(struct multi_system_compositor *msc,
+ 	mc->base.base.layer_equirect1 = multi_compositor_layer_equirect1;
+ 	mc->base.base.layer_equirect2 = multi_compositor_layer_equirect2;
+ 	mc->base.base.layer_commit = multi_compositor_layer_commit;
++	mc->base.base.layer_commit_with_fence = multi_compositor_layer_commit_with_fence;
+ 	mc->base.base.layer_commit_with_semaphore = multi_compositor_layer_commit_with_semaphore;
+ 	mc->base.base.destroy = multi_compositor_destroy;
+ 	mc->base.base.set_thread_hint = multi_compositor_set_thread_hint;
+-- 
+2.55.0
+
+
+From 84bbaedd4e1a58ae1ca85ef0e155fa69c854c6af Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Sat, 30 May 2026 23:26:36 +0200
+Subject: [PATCH 05/11] ipc: Add fence import/destroy functions
+
+Signed-off-by: Patrick Nicolas <patricknicolas@laposte.net>
+---
+ src/xrt/include/xrt/xrt_handles.h             |  2 +
+ src/xrt/ipc/server/ipc_server.h               |  4 ++
+ src/xrt/ipc/server/ipc_server_handler.c       | 69 +++++++++++++++++++
+ .../ipc/server/ipc_server_per_client_thread.c |  6 ++
+ src/xrt/ipc/shared/proto/50-compositor.json   | 13 ++++
+ 5 files changed, 94 insertions(+)
+
+diff --git a/src/xrt/include/xrt/xrt_handles.h b/src/xrt/include/xrt/xrt_handles.h
+index e6222abae..97f258742 100644
+--- a/src/xrt/include/xrt/xrt_handles.h
++++ b/src/xrt/include/xrt/xrt_handles.h
+@@ -366,6 +366,7 @@ typedef int xrt_graphics_sync_handle_t;
+  */
+ #define XRT_GRAPHICS_SYNC_HANDLE_IS_FD 1
+ 
++#define XRT_FENCE_HANDLE_TYPE XRT_SYNC_HANDLE_OPAQUE_FD
+ #define XRT_TEMPORARY_FENCE_HANDLE_TYPE XRT_SYNC_HANDLE_SYNC_FD
+ 
+ /*!
+@@ -406,6 +407,7 @@ typedef HANDLE xrt_graphics_sync_handle_t;
+  */
+ #define XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE 1
+ 
++#define XRT_FENCE_HANDLE_TYPE XRT_SYNC_HANDLE_OPAQUE_WIN32
+ #define XRT_TEMPORARY_FENCE_HANDLE_TYPE XRT_SYNC_HANDLE_OPAQUE_WIN32
+ 
+ /*!
+diff --git a/src/xrt/ipc/server/ipc_server.h b/src/xrt/ipc/server/ipc_server.h
+index 4e781ed6c..9f3731127 100644
+--- a/src/xrt/ipc/server/ipc_server.h
++++ b/src/xrt/ipc/server/ipc_server.h
+@@ -63,6 +63,7 @@ extern "C" {
+ #define IPC_MAX_CLIENT_HAND_TRACKERS 16
+ #define IPC_MAX_CLIENT_APP_INSTANCES 4
+ #define IPC_MAX_CLIENT_APP_SYSTEMS (IPC_MAX_CLIENT_APP_INSTANCES * 4)
++#define IPC_MAX_CLIENT_FENCES 2
+ #define IPC_MAX_CLIENT_SEMAPHORES 8
+ #define IPC_MAX_CLIENT_SWAPCHAINS (XRT_MAX_LAYERS * 2)
+ #define IPC_MAX_CLIENT_SPACES 128
+@@ -160,6 +161,9 @@ struct ipc_client_state
+ 	//! Data for the swapchains.
+ 	struct ipc_swapchain_data swapchain_data[IPC_MAX_CLIENT_SWAPCHAINS];
+ 
++	//! Ptrs to the fences.
++	struct xrt_compositor_fence *xcfs[IPC_MAX_CLIENT_FENCES];
++
+ 	//! Number of compositor semaphores in use by client
+ 	uint32_t compositor_semaphore_count;
+ 
+diff --git a/src/xrt/ipc/server/ipc_server_handler.c b/src/xrt/ipc/server/ipc_server_handler.c
+index 5df3612b6..81f85f410 100644
+--- a/src/xrt/ipc/server/ipc_server_handler.c
++++ b/src/xrt/ipc/server/ipc_server_handler.c
+@@ -1606,6 +1606,75 @@ ipc_handle_system_set_client_io_blocks(volatile struct ipc_client_state *_ics,
+ 	return ipc_server_set_client_io_blocks(s, client_id, blocks);
+ }
+ 
++/*
++ *
++ * Compositor fence functions.
++ *
++ */
++
++xrt_result_t
++ipc_handle_compositor_fence_import(volatile struct ipc_client_state *ics,
++                                   uint32_t *out_id,
++                                   const xrt_graphics_sync_handle_t *handles,
++                                   const uint32_t handle_count)
++{
++	xrt_result_t xret;
++
++	if (ics->xc == NULL) {
++		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
++	}
++
++	if (handle_count != 1) {
++		return XRT_ERROR_INVALID_ARGUMENT;
++	}
++
++	int id = 0;
++	for (; id < IPC_MAX_CLIENT_FENCES; id++) {
++		if (ics->xcfs[id] == NULL) {
++			break;
++		}
++	}
++
++	if (id == IPC_MAX_CLIENT_FENCES) {
++		IPC_ERROR(ics->server, "Too many compositor fences alive!");
++		return XRT_ERROR_IPC_FAILURE;
++	}
++
++	struct xrt_compositor_fence *xcf = NULL;
++	xrt_graphics_sync_handle_t handle = handles[0];
++
++	xret = xrt_comp_import_fence(ics->xc, handle, XRT_FENCE_HANDLE_TYPE, &xcf);
++	if (xret != XRT_SUCCESS) {
++		IPC_ERROR(ics->server, "Failed to import compositor fence!");
++		return xret;
++	}
++
++	// Set it directly, no need to use reference here.
++	ics->xcfs[id] = xcf;
++
++	// Set out parameters.
++	*out_id = id;
++
++	return XRT_SUCCESS;
++}
++
++xrt_result_t
++ipc_handle_compositor_fence_destroy(volatile struct ipc_client_state *ics, uint32_t id)
++{
++	if (ics->xc == NULL) {
++		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
++	}
++
++	if (ics->xcfs[id] == NULL) {
++		IPC_ERROR(ics->server, "Client tried to delete non-existent compositor fence!");
++		return XRT_ERROR_IPC_FAILURE;
++	}
++
++	// Drop our reference, does NULL checking. Cast away volatile.
++	xrt_compositor_fence_reference((struct xrt_compositor_fence **)&ics->xcfs[id], NULL);
++
++	return XRT_SUCCESS;
++}
+ 
+ /*
+  *
+diff --git a/src/xrt/ipc/server/ipc_server_per_client_thread.c b/src/xrt/ipc/server/ipc_server_per_client_thread.c
+index 1ba3256a3..566d065be 100644
+--- a/src/xrt/ipc/server/ipc_server_per_client_thread.c
++++ b/src/xrt/ipc/server/ipc_server_per_client_thread.c
+@@ -459,6 +459,12 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
+ 		IPC_TRACE(ics->server, "Destroyed swapchain %d.", j);
+ 	}
+ 
++	for (uint32_t j = 0; j < IPC_MAX_CLIENT_FENCES; j++) {
++		// Drop our reference, does NULL checking. Cast away volatile.
++		xrt_compositor_fence_reference((struct xrt_compositor_fence **)&ics->xcfs[j], NULL);
++		IPC_TRACE(ics->server, "Destroyed compositor fence %d.", j);
++	}
++
+ 	for (uint32_t j = 0; j < IPC_MAX_CLIENT_SEMAPHORES; j++) {
+ 		// Drop our reference, does NULL checking. Cast away volatile.
+ 		xrt_compositor_semaphore_reference((struct xrt_compositor_semaphore **)&ics->xcsems[j], NULL);
+diff --git a/src/xrt/ipc/shared/proto/50-compositor.json b/src/xrt/ipc/shared/proto/50-compositor.json
+index 3b2dbf8f8..304d1ced5 100644
+--- a/src/xrt/ipc/shared/proto/50-compositor.json
++++ b/src/xrt/ipc/shared/proto/50-compositor.json
+@@ -104,6 +104,19 @@
+ 
+ 	"compositor_destroy_passthrough": {},
+ 
++	"compositor_fence_import": {
++		"in_handles": {"type": "xrt_graphics_sync_handle_t"},
++		"out": [
++			{"name": "id", "type": "uint32_t"}
++		]
++	},
++
++	"compositor_fence_destroy": {
++		"in": [
++			{"name": "id", "type": "uint32_t"}
++		]
++	},
++
+ 	"compositor_semaphore_create": {
+ 		"out": [
+ 			{"name": "id", "type": "uint32_t"}
+-- 
+2.55.0
+
+
+From 5d064b8d03ecbc8b61959e248ac899fce587dfcb Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Sat, 30 May 2026 23:29:50 +0200
+Subject: [PATCH 06/11] ipc: add layer_sync_with_fence
+
+Signed-off-by: Patrick Nicolas <patricknicolas@laposte.net>
+---
+ src/xrt/ipc/server/ipc_server_handler.c     | 56 +++++++++++++++++++++
+ src/xrt/ipc/shared/proto/50-compositor.json | 10 ++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/src/xrt/ipc/server/ipc_server_handler.c b/src/xrt/ipc/server/ipc_server_handler.c
+index 81f85f410..f69642273 100644
+--- a/src/xrt/ipc/server/ipc_server_handler.c
++++ b/src/xrt/ipc/server/ipc_server_handler.c
+@@ -1389,6 +1389,62 @@ ipc_handle_compositor_layer_sync(volatile struct ipc_client_state *ics,
+ 	return xret;
+ }
+ 
++xrt_result_t
++ipc_handle_compositor_layer_sync_with_fence(volatile struct ipc_client_state *ics,
++                                            uint32_t slot_id,
++                                            uint32_t fence_id,
++                                            uint32_t *out_free_slot_id)
++{
++	IPC_TRACE_MARKER();
++
++	if (ics->xc == NULL) {
++		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
++	}
++	if (fence_id >= IPC_MAX_CLIENT_FENCES) {
++		IPC_ERROR(ics->server, "Invalid fence_id");
++		return XRT_ERROR_IPC_FAILURE;
++	}
++	if (ics->xcfs[fence_id] == NULL) {
++		IPC_ERROR(ics->server, "Fence of id %u not created!", fence_id);
++		return XRT_ERROR_IPC_FAILURE;
++	}
++
++	struct xrt_compositor_fence *xcf = NULL;
++	xrt_compositor_fence_reference(&xcf, ics->xcfs[fence_id]);
++
++	struct ipc_shared_memory *ism = get_ism(ics);
++	struct ipc_layer_slot *slot = &ism->slots[slot_id];
++
++	// Copy current slot data.
++	struct ipc_layer_slot copy = *slot;
++
++
++
++	/*
++	 * Transfer data to underlying compositor.
++	 */
++
++	xrt_comp_layer_begin(ics->xc, &copy.data);
++
++	_update_layers(ics, ics->xc, &copy);
++
++	xrt_comp_layer_commit_with_fence(ics->xc, xcf);
++
++
++	/*
++	 * Manage shared state.
++	 */
++
++	os_mutex_lock(&ics->server->global_state.lock);
++
++	*out_free_slot_id = (ics->server->current_slot_index + 1) % IPC_MAX_SLOTS;
++	ics->server->current_slot_index = *out_free_slot_id;
++
++	os_mutex_unlock(&ics->server->global_state.lock);
++
++	return XRT_SUCCESS;
++}
++
+ xrt_result_t
+ ipc_handle_compositor_layer_sync_with_semaphore(volatile struct ipc_client_state *ics,
+                                                 uint32_t slot_id,
+diff --git a/src/xrt/ipc/shared/proto/50-compositor.json b/src/xrt/ipc/shared/proto/50-compositor.json
+index 304d1ced5..f4c31e7cb 100644
+--- a/src/xrt/ipc/shared/proto/50-compositor.json
++++ b/src/xrt/ipc/shared/proto/50-compositor.json
+@@ -44,6 +44,16 @@
+ 		]
+ 	},
+ 
++	"compositor_layer_sync_with_fence": {
++		"in": [
++			{"name": "slot_id", "type": "uint32_t"},
++			{"name": "fence_id", "type": "uint32_t"}
++		],
++		"out": [
++			{"name": "free_slot_id", "type": "uint32_t"}
++		]
++	},
++
+ 	"compositor_layer_sync_with_semaphore": {
+ 		"in": [
+ 			{"name": "slot_id", "type": "uint32_t"},
+-- 
+2.55.0
+
+
+From d6e7837590466f233d4a938833b19ba8925054fd Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Sat, 30 May 2026 23:38:02 +0200
+Subject: [PATCH 07/11] ipc/compositor: Add fence import function
+
+Signed-off-by: Patrick Nicolas <patricknicolas@laposte.net>
+---
+ src/xrt/ipc/client/ipc_client_compositor.c | 82 ++++++++++++++++++++++
+ 1 file changed, 82 insertions(+)
+
+diff --git a/src/xrt/ipc/client/ipc_client_compositor.c b/src/xrt/ipc/client/ipc_client_compositor.c
+index 4fc89d529..6b0fa5407 100644
+--- a/src/xrt/ipc/client/ipc_client_compositor.c
++++ b/src/xrt/ipc/client/ipc_client_compositor.c
+@@ -92,6 +92,19 @@ struct ipc_client_swapchain
+ 	uint32_t id;
+ };
+ 
++/*!
++ * Client proxy for an xrt_compositor_fence implementation over IPC.
++ * @implements xrt_compositor_semaphore
++ */
++struct ipc_client_compositor_fence
++{
++	struct xrt_compositor_fence base;
++
++	struct ipc_client_compositor *icc;
++
++	uint32_t id;
++};
++
+ /*!
+  * Client proxy for an xrt_compositor_semaphore implementation over IPC.
+  * @implements xrt_compositor_semaphore
+@@ -124,6 +137,12 @@ ipc_client_swapchain(struct xrt_swapchain *xs)
+ 	return (struct ipc_client_swapchain *)xs;
+ }
+ 
++static inline struct ipc_client_compositor_fence *
++ipc_client_compositor_fence(struct xrt_compositor_fence *xcf)
++{
++	return (struct ipc_client_compositor_fence *)xcf;
++}
++
+ static inline struct ipc_client_compositor_semaphore *
+ ipc_client_compositor_semaphore(struct xrt_compositor_semaphore *xcsem)
+ {
+@@ -208,6 +227,38 @@ ipc_compositor_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index
+ 	IPC_CHK_ALWAYS_RET(icc->ipc_c, xret, "ipc_call_swapchain_release_image");
+ }
+ 
++/*
++ *
++ * Compositor fence functions.
++ *
++ */
++
++static xrt_result_t
++ipc_client_compositor_fence_wait(struct xrt_compositor_fence *xcf, uint64_t timeout_ns)
++{
++	struct ipc_client_compositor_fence *iccf = ipc_client_compositor_fence(xcf);
++	struct ipc_client_compositor *icc = iccf->icc;
++
++	IPC_ERROR(icc->ipc_c, "Cannot call wait on client side!");
++
++	return XRT_ERROR_IPC_FAILURE;
++}
++
++static void
++ipc_client_compositor_fence_destroy(struct xrt_compositor_fence *xcf)
++{
++	struct ipc_client_compositor_fence *iccs = ipc_client_compositor_fence(xcf);
++	struct ipc_client_compositor *icc = iccs->icc;
++	xrt_result_t xret;
++
++	xret = ipc_call_compositor_fence_destroy(icc->ipc_c, iccs->id);
++
++	// Can't return anything here, just continue.
++	IPC_CHK_ONLY_PRINT(icc->ipc_c, xret, "ipc_call_compositor_fence_destroy");
++
++	free(iccs);
++}
++
+ 
+ /*
+  *
+@@ -470,6 +521,36 @@ ipc_compositor_swapchain_import(struct xrt_compositor *xc,
+ 	return swapchain_server_import(icc, info, native_images, image_count, out_xsc);
+ }
+ 
++static xrt_result_t
++ipc_compositor_fence_import(struct xrt_compositor *xc,
++                            xrt_graphics_sync_handle_t handle,
++                            enum xrt_graphics_sync_handle_type handle_type,
++                            struct xrt_compositor_fence **out_xcf)
++{
++	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
++	xrt_result_t xret;
++	uint32_t id = 0;
++
++	if (handle_type != XRT_FENCE_HANDLE_TYPE) {
++		IPC_ERROR(icc->ipc_c, "invalid fence type to import");
++		return XRT_ERROR_INVALID_ARGUMENT;
++	}
++
++	xret = ipc_call_compositor_fence_import(icc->ipc_c, &handle, 1, &id);
++	IPC_CHK_AND_RET(icc->ipc_c, xret, "ipc_call_compositor_fence_import");
++
++	struct ipc_client_compositor_fence *iccf = U_TYPED_CALLOC(struct ipc_client_compositor_fence);
++	iccf->base.reference.count = 1;
++	iccf->base.wait = ipc_client_compositor_fence_wait;
++	iccf->base.destroy = ipc_client_compositor_fence_destroy;
++	iccf->id = id;
++	iccf->icc = icc;
++
++	*out_xcf = &iccf->base;
++
++	return XRT_SUCCESS;
++}
++
+ static xrt_result_t
+ ipc_compositor_semaphore_create(struct xrt_compositor *xc,
+                                 xrt_graphics_sync_handle_t *out_handle,
+@@ -889,6 +970,7 @@ ipc_compositor_init(struct ipc_client_compositor *icc, struct xrt_compositor_nat
+ 	icc->base.base.get_swapchain_create_properties = ipc_compositor_get_swapchain_create_properties;
+ 	icc->base.base.create_swapchain = ipc_compositor_swapchain_create;
+ 	icc->base.base.import_swapchain = ipc_compositor_swapchain_import;
++	icc->base.base.import_fence = ipc_compositor_fence_import;
+ 	icc->base.base.create_semaphore = ipc_compositor_semaphore_create;
+ 	icc->base.base.create_passthrough = ipc_compositor_create_passthrough;
+ 	icc->base.base.create_passthrough_layer = ipc_compositor_create_passthrough_layer;
+-- 
+2.55.0
+
+
+From 42a830fcb785065a935167dc7ab7c7c38ae882ca Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Sat, 30 May 2026 23:40:34 +0200
+Subject: [PATCH 08/11] ipc/compositor: Add commit_with_fence
+
+Signed-off-by: Patrick Nicolas <patricknicolas@laposte.net>
+---
+ src/xrt/ipc/client/ipc_client_compositor.c | 32 ++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/src/xrt/ipc/client/ipc_client_compositor.c b/src/xrt/ipc/client/ipc_client_compositor.c
+index 6b0fa5407..c1bfbc7d4 100644
+--- a/src/xrt/ipc/client/ipc_client_compositor.c
++++ b/src/xrt/ipc/client/ipc_client_compositor.c
+@@ -855,6 +855,37 @@ ipc_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_
+ 	return xret;
+ }
+ 
++static xrt_result_t
++ipc_compositor_layer_commit_with_fence(struct xrt_compositor *xc, struct xrt_compositor_fence *xcf)
++{
++	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
++	struct ipc_client_compositor_fence *iccf = ipc_client_compositor_fence(xcf);
++	xrt_result_t xret;
++
++	struct ipc_shared_memory *ism = icc->ipc_c->ism;
++	struct ipc_layer_slot *slot = &ism->slots[icc->layers.slot_id];
++
++	// Last bit of data to put in the shared memory area.
++	slot->layer_count = icc->layers.layer_count;
++
++	xret = ipc_call_compositor_layer_sync_with_fence( //
++	    icc->ipc_c,                                   //
++	    icc->layers.slot_id,                          //
++	    iccf->id,                                     //
++	    &icc->layers.slot_id);                        //
++
++	/*
++	 * We are probably in a really bad state if we fail, at
++	 * least print out the error and continue as best we can.
++	 */
++	IPC_CHK_ONLY_PRINT(icc->ipc_c, xret, "ipc_call_compositor_layer_sync_with_fence");
++
++	// Reset.
++	icc->layers.layer_count = 0;
++
++	return xret;
++}
++
+ static xrt_result_t
+ ipc_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
+                                            struct xrt_compositor_semaphore *xcsem,
+@@ -990,6 +1021,7 @@ ipc_compositor_init(struct ipc_client_compositor *icc, struct xrt_compositor_nat
+ 	icc->base.base.layer_equirect2 = ipc_compositor_layer_equirect2;
+ 	icc->base.base.layer_passthrough = ipc_compositor_layer_passthrough;
+ 	icc->base.base.layer_commit = ipc_compositor_layer_commit;
++	icc->base.base.layer_commit_with_fence = ipc_compositor_layer_commit_with_fence;
+ 	icc->base.base.layer_commit_with_semaphore = ipc_compositor_layer_commit_with_semaphore;
+ 	icc->base.base.destroy = ipc_compositor_destroy;
+ 	icc->base.base.set_thread_hint = ipc_compositor_set_thread_hint;
+-- 
+2.55.0
+
+
+From 910ecbb9a65d5a245c6a0ce04254aa8b8d4cdfe7 Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Sun, 31 May 2026 00:00:39 +0200
+Subject: [PATCH 09/11] c/client: Reuse fences
+
+Create a pair of fences on setup, shared with the server. This allows
+similar behaviour as timelines semaphores, without the need for the
+feature to be enabled.
+
+Signed-off-by: Patrick Nicolas <patricknicolas@laposte.net>
+---
+ src/xrt/compositor/client/comp_vk_client.c | 142 ++++++++++++++++++++-
+ src/xrt/compositor/client/comp_vk_client.h |   7 +
+ 2 files changed, 148 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/compositor/client/comp_vk_client.c b/src/xrt/compositor/client/comp_vk_client.c
+index ad3c7a6f7..03807ff90 100644
+--- a/src/xrt/compositor/client/comp_vk_client.c
++++ b/src/xrt/compositor/client/comp_vk_client.c
+@@ -129,6 +129,92 @@ setup_semaphore(struct client_vk_compositor *c)
+ }
+ #endif
+ 
++/*
++ *
++ * Fence helpers.
++ *
++ */
++
++static xrt_result_t
++setup_fences(struct client_vk_compositor *c)
++{
++	struct vk_bundle *vk = &c->vk;
++	xrt_result_t xret;
++
++#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
++	const VkExternalFenceHandleTypeFlags handle_type = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT;
++	if (!vk->external.fence_opaque_fd) {
++		return XRT_SUCCESS;
++	}
++#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
++	const VkExternalFenceHandleTypeFlags handle_type = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++#else
++#error "Need port to export fence sync handles"
++#endif
++
++	for (size_t i = 0; i < ARRAY_SIZE(c->fences); i++) {
++		xrt_graphics_sync_handle_t handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
++		VkResult ret;
++		VkFence fence;
++		VkExportFenceCreateInfo export_create_info = {
++		    .sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
++		    .handleTypes = handle_type,
++		};
++		VkFenceCreateInfo fence_info = {
++		    .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
++		    .pNext = (const void *)&export_create_info,
++		    .flags = VK_FENCE_CREATE_SIGNALED_BIT,
++		};
++		ret = vk->vkCreateFence(vk->device, &fence_info, NULL, &fence);
++		if (ret != VK_SUCCESS) {
++			VK_ERROR(vk, "vkCreateFence: %s", vk_result_string(ret));
++			return XRT_ERROR_FENCE_CREATE_FAILED;
++		}
++		VK_NAME_FENCE(vk, fence, "VK shared fence");
++
++#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
++		VkFenceGetFdInfoKHR get_fd_info = {
++		    .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
++		    .fence = fence,
++		    .handleType = handle_type,
++		};
++
++		ret = vk->vkGetFenceFdKHR(vk->device, &get_fd_info, &handle);
++		if (ret != VK_SUCCESS) {
++			VK_ERROR(vk, "vkGetFenceFdKHR: %s", vk_result_string(ret));
++			vk->vkDestroyFence(vk->device, fence, NULL);
++			return XRT_ERROR_FENCE_CREATE_FAILED;
++		}
++#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
++		//! @todo Not tested.
++		VkFenceGetWin32HandleInfoKHR get_handle_info = {
++		    .sType = VK_STRUCTURE_TYPE_FENCE_GET_WIN32_HANDLE_INFO_KHR,
++		    .fence = fence,
++		    .handleType = handle_type,
++		};
++
++		ret = vk->vkGetFenceWin32HandleKHR(vk->device, &get_handle_info, &handle);
++		if (ret != VK_SUCCESS) {
++			VK_ERROR(vk, "vkGetFenceWin32HandleKHR: %s", vk_result_string(ret));
++			vk->vkDestroyFence(vk->device, fence, NULL);
++			return XRT_ERROR_FENCE_CREATE_FAILED;
++		}
++#else
++#error "Need port to import fence sync handles"
++#endif
++
++		xret = xrt_comp_import_fence(&c->xcn->base, handle, XRT_FENCE_HANDLE_TYPE, &c->fences[i].xcf);
++		if (xret != XRT_SUCCESS) {
++			U_LOG_E("Failed to import fence!");
++			return xret;
++		}
++		c->fences[i].fence = fence;
++		u_graphics_sync_unref(&handle);
++	}
++
++	return XRT_SUCCESS;
++}
++
+ 
+ /*
+  *
+@@ -205,6 +291,43 @@ submit_semaphore(struct client_vk_compositor *c, xrt_result_t *out_xret)
+ 
+ static bool
+ submit_fence(struct client_vk_compositor *c, xrt_result_t *out_xret)
++{
++	struct vk_bundle *vk = &c->vk;
++	VkResult ret;
++
++	if (c->fences[c->current_fence].fence == VK_NULL_HANDLE) {
++		return false;
++	}
++	ret = vk->vkWaitForFences(vk->device, 1, &c->fences[c->current_fence].fence, VK_TRUE, U_TIME_1S_IN_NS);
++	if (ret != VK_SUCCESS) {
++		U_LOG_W("fence timeout");
++		return false;
++	}
++	vk->vkResetFences(vk->device, 1, &c->fences[c->current_fence].fence);
++	COMP_TRACE_IDENT(submit_fence);
++	c->current_fence = (c->current_fence + 1) % ARRAY_SIZE(c->fences);
++	vk_queue_lock(vk->main_queue);
++
++	ret = vk->vkQueueSubmit(                //
++	    vk->main_queue->queue,              // queue
++	    0,                                  // submitCount
++	    NULL,                               // pSubmits
++	    c->fences[c->current_fence].fence); // fence
++
++	vk_queue_unlock(vk->main_queue);
++
++	if (ret != VK_SUCCESS) {
++		VK_ERROR(vk, "vkQueueSubmit: %s", vk_result_string(ret));
++		*out_xret = XRT_ERROR_VULKAN;
++		return true;
++	}
++
++	*out_xret = xrt_comp_layer_commit_with_fence(&c->xcn->base, c->fences[c->current_fence].xcf);
++	return true;
++}
++
++static bool
++submit_temporary_fence(struct client_vk_compositor *c, xrt_result_t *out_xret)
+ {
+ 	xrt_graphics_sync_handle_t sync_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+ 	struct vk_bundle *vk = &c->vk;
+@@ -408,6 +531,15 @@ client_vk_compositor_destroy(struct xrt_compositor *xc)
+ 	}
+ 	xrt_compositor_semaphore_reference(&c->sync.xcsem, NULL);
+ 
++	for (size_t i = 0; i < ARRAY_SIZE(c->fences); i++) {
++		if (c->fences[i].fence != VK_NULL_HANDLE) {
++			vk->vkDestroyFence(vk->device, c->fences[i].fence, NULL);
++		}
++		if (c->fences[i].xcf) {
++			xrt_compositor_fence_reference(&c->fences[i].xcf, NULL);
++		}
++	}
++
+ 	// Now safe to free the pool.
+ 	vk_cmd_pool_destroy(vk, &c->pool);
+ 
+@@ -635,6 +767,8 @@ client_vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_h
+ 		return xret;
+ 	} else if (submit_fence(c, &xret)) {
+ 		return xret;
++	} else if (submit_temporary_fence(c, &xret)) {
++		return xret;
+ 	} else if (submit_fallback(c, &xret)) {
+ 		return xret;
+ 	} else {
+@@ -901,8 +1035,14 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
+ 		if (xret != XRT_SUCCESS) {
+ 			goto err_pool;
+ 		}
+-	}
++	} else
+ #endif
++	{
++		xret = setup_fences(c);
++		if (xret != XRT_SUCCESS) {
++			goto err_pool;
++		}
++	}
+ 
+ 	// Get max texture size.
+ 	{
+diff --git a/src/xrt/compositor/client/comp_vk_client.h b/src/xrt/compositor/client/comp_vk_client.h
+index 63f333184..3ba106634 100644
+--- a/src/xrt/compositor/client/comp_vk_client.h
++++ b/src/xrt/compositor/client/comp_vk_client.h
+@@ -76,6 +76,13 @@ struct client_vk_compositor
+ 		uint64_t value;
+ 	} sync;
+ 
++	struct
++	{
++		VkFence fence;
++		struct xrt_compositor_fence *xcf;
++	} fences[2];
++	int current_fence;
++
+ 	struct vk_bundle vk;
+ 
+ 	struct vk_cmd_pool pool;
+-- 
+2.55.0
+
+
+From a886c6352361d696cc39fc2d5d0a9c28976cefab Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Wed, 3 Jun 2026 18:31:28 +0200
+Subject: [PATCH 10/11] splitme: pass handle type in ipc fence import
+
+---
+ src/xrt/ipc/client/ipc_client_compositor.c  | 7 +------
+ src/xrt/ipc/server/ipc_server_handler.c     | 8 +++++++-
+ src/xrt/ipc/shared/proto/50-compositor.json | 3 +++
+ 3 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/src/xrt/ipc/client/ipc_client_compositor.c b/src/xrt/ipc/client/ipc_client_compositor.c
+index c1bfbc7d4..5fd5cb966 100644
+--- a/src/xrt/ipc/client/ipc_client_compositor.c
++++ b/src/xrt/ipc/client/ipc_client_compositor.c
+@@ -531,12 +531,7 @@ ipc_compositor_fence_import(struct xrt_compositor *xc,
+ 	xrt_result_t xret;
+ 	uint32_t id = 0;
+ 
+-	if (handle_type != XRT_FENCE_HANDLE_TYPE) {
+-		IPC_ERROR(icc->ipc_c, "invalid fence type to import");
+-		return XRT_ERROR_INVALID_ARGUMENT;
+-	}
+-
+-	xret = ipc_call_compositor_fence_import(icc->ipc_c, &handle, 1, &id);
++	xret = ipc_call_compositor_fence_import(icc->ipc_c, handle_type, &handle, 1, &id);
+ 	IPC_CHK_AND_RET(icc->ipc_c, xret, "ipc_call_compositor_fence_import");
+ 
+ 	struct ipc_client_compositor_fence *iccf = U_TYPED_CALLOC(struct ipc_client_compositor_fence);
+diff --git a/src/xrt/ipc/server/ipc_server_handler.c b/src/xrt/ipc/server/ipc_server_handler.c
+index f69642273..3be839e95 100644
+--- a/src/xrt/ipc/server/ipc_server_handler.c
++++ b/src/xrt/ipc/server/ipc_server_handler.c
+@@ -1670,6 +1670,7 @@ ipc_handle_system_set_client_io_blocks(volatile struct ipc_client_state *_ics,
+ 
+ xrt_result_t
+ ipc_handle_compositor_fence_import(volatile struct ipc_client_state *ics,
++                                   enum xrt_graphics_sync_handle_type handle_type,
+                                    uint32_t *out_id,
+                                    const xrt_graphics_sync_handle_t *handles,
+                                    const uint32_t handle_count)
+@@ -1696,10 +1697,15 @@ ipc_handle_compositor_fence_import(volatile struct ipc_client_state *ics,
+ 		return XRT_ERROR_IPC_FAILURE;
+ 	}
+ 
++	if (handle_type != XRT_FENCE_HANDLE_TYPE) {
++		IPC_ERROR(ics->server, "invalid fence handle type");
++		return XRT_ERROR_INVALID_ARGUMENT;
++	}
++
+ 	struct xrt_compositor_fence *xcf = NULL;
+ 	xrt_graphics_sync_handle_t handle = handles[0];
+ 
+-	xret = xrt_comp_import_fence(ics->xc, handle, XRT_FENCE_HANDLE_TYPE, &xcf);
++	xret = xrt_comp_import_fence(ics->xc, handle, handle_type, &xcf);
+ 	if (xret != XRT_SUCCESS) {
+ 		IPC_ERROR(ics->server, "Failed to import compositor fence!");
+ 		return xret;
+diff --git a/src/xrt/ipc/shared/proto/50-compositor.json b/src/xrt/ipc/shared/proto/50-compositor.json
+index f4c31e7cb..1e4777b04 100644
+--- a/src/xrt/ipc/shared/proto/50-compositor.json
++++ b/src/xrt/ipc/shared/proto/50-compositor.json
+@@ -116,6 +116,9 @@
+ 
+ 	"compositor_fence_import": {
+ 		"in_handles": {"type": "xrt_graphics_sync_handle_t"},
++		"in": [
++			{"name": "handle_type", "type": "enum xrt_graphics_sync_handle_type"}
++		],
+ 		"out": [
+ 			{"name": "id", "type": "uint32_t"}
+ 		]
+-- 
+2.55.0
+
+
+From 9b2b9e71ef0e30789cae0099dd9556d71defe122 Mon Sep 17 00:00:00 2001
+From: hypevhs <hackgammavision@gmail.com>
+Date: Tue, 22 Sep 2026 18:49:55 -0500
+Subject: [PATCH 11/11] fixup! ipc: add layer_sync_with_fence
+
+---
+ src/xrt/ipc/server/ipc_server_handler.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/xrt/ipc/server/ipc_server_handler.c b/src/xrt/ipc/server/ipc_server_handler.c
+index 3be839e95..66c0d4ccb 100644
+--- a/src/xrt/ipc/server/ipc_server_handler.c
++++ b/src/xrt/ipc/server/ipc_server_handler.c
+@@ -1426,7 +1426,7 @@ ipc_handle_compositor_layer_sync_with_fence(volatile struct ipc_client_state *ic
+ 
+ 	xrt_comp_layer_begin(ics->xc, &copy.data);
+ 
+-	_update_layers(ics, ics->xc, &copy);
++	_update_layers(ics, &copy);
+ 
+ 	xrt_comp_layer_commit_with_fence(ics->xc, xcf);
+ 
+-- 
+2.55.0
+
